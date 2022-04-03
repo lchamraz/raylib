@@ -164,6 +164,7 @@
 #include <string.h>                 // Required for: strrchr(), strcmp(), strlen()
 #include <time.h>                   // Required for: time() [Used in InitTimer()]
 #include <math.h>                   // Required for: tan() [Used in BeginMode3D()], atan2f() [Used in LoadVrStereoConfig()]
+#include <poll.h>
 
 #include <sys/stat.h>               // Required for: stat() [Used in GetFileModTime()]
 
@@ -338,6 +339,7 @@
 typedef struct {
     pthread_t threadId;             // Event reading thread id
     int fd;                         // File descriptor to the device it is assigned to
+    struct pollfd *pfds;
     int eventNum;                   // Number of 'event<N>' device
     Rectangle absRange;             // Range of values for absolute pointing devices (touchscreens)
     int touchSlot;                  // Hold the touch slot number of the currently being sent multitouch block
@@ -4354,7 +4356,7 @@ static bool InitGraphicsDevice(int width, int height)
     // Load OpenGL extensions
     // NOTE: GLFW loader function is required by GLAD but only used for OpenGL 2.1 and 3.3,
     // OpenGL ES 2.0 extensions (and entry points) are loaded manually using eglGetProcAddress()
-    rlLoadExtensions(glfwGetProcAddress);
+    rlLoadExtensions(eglGetProcAddress);
 
     // Initialize OpenGL context (states and resources)
     // NOTE: CORE.Window.screen.width and CORE.Window.screen.height not used, just stored as globals in rlgl
@@ -5704,6 +5706,7 @@ static void ConfigureEvdevDevice(char *device)
     #define LONG(x)         ((x)/BITS_PER_LONG)
     #define TEST_BIT(array, bit) ((array[LONG(bit)] >> OFF(bit)) & 1)
 
+    struct pollfd *pfds;
     struct input_absinfo absinfo;
     unsigned long evBits[NBITS(EV_MAX)];
     unsigned long absBits[NBITS(ABS_MAX)];
@@ -5749,6 +5752,20 @@ static void ConfigureEvdevDevice(char *device)
         return;
     }
     worker->fd = fd;
+
+    pfds = calloc(1, sizeof(struct pollfd));
+    
+    if (pfds < 0) 
+    {
+        TRACELOG(LOG_WARNING, "RPI: Failed to allocate memory");
+        close(fd);
+        return;
+    }
+
+    pfds->fd = fd;
+    pfds->events = POLLIN;
+
+    worker->pfds = pfds;
 
     // Grab number on the end of the devices name "event<N>"
     int devNum = 0;
@@ -5866,6 +5883,7 @@ static void ConfigureEvdevDevice(char *device)
         {
             TRACELOG(LOG_WARNING, "RPI: Failed to create input device thread: %s (error: %d)", device, error);
             worker->threadId = 0;
+            free(pfds);
             close(fd);
         }
 
@@ -5887,13 +5905,18 @@ static void ConfigureEvdevDevice(char *device)
                 {
                     TRACELOG(LOG_WARNING, "RPI: Found duplicate touchscreen, killing touchscreen on event: %d", i);
                     pthread_cancel(CORE.Input.eventWorker[i].threadId);
+                    free(CORE.Input.eventWorker[i].pfds);
                     close(CORE.Input.eventWorker[i].fd);
                 }
             }
         }
 #endif
     }
-    else close(fd);  // We are not interested in this device
+    else 
+    {
+        free(pfds);
+        close(fd);  // We are not interested in this device
+    }
     //-------------------------------------------------------------------------------------------------------
 }
 
@@ -5976,10 +5999,23 @@ static void *EventThread(void *arg)
     int touchAction = -1;
     bool gestureUpdate = false;
 
+    int ready;
+
     while (!CORE.Window.shouldClose)
     {
+        TRACELOG(LOG_INFO, "RPI: Event polling");
+
+        ready = poll(worker->pfds, 1, 1000);
+
+        if (ready == -1)
+        {
+            break;
+        }
+
+        TRACELOG(LOG_INFO, "RPI: Events ready: %d: %d", ready, worker->pfds->revents);
+
         // Try to read data from the device and only continue if successful
-        while (read(worker->fd, &event, sizeof(event)) == (int)sizeof(event))
+        if ((ready > 0) && (worker->pfds->revents & POLLIN) && (read(worker->fd, &event, sizeof(event)) == (int)sizeof(event)))
         {
             // Relative movement parsing
             if (event.type == EV_REL)
@@ -6143,9 +6179,10 @@ static void *EventThread(void *arg)
             #endif
             }
         }
-        Wait(5);    // Sleep for 5ms to avoid hogging CPU time
+        //Wait(5);    // Sleep for 5ms to avoid hogging CPU time
     }
 
+    free(worker->pfds);
     close(worker->fd);
 
     return NULL;
